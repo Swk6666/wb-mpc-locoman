@@ -7,16 +7,29 @@ import matplotlib.pyplot as plt
 from args import *
 from utils.robot import *
 from utils.visualization import visualize_forces
+from utils.trajectory import CircleTrajectory, HelixTrajectory
 from optimization import make_ocp
 
 # Robot params
-robot = B2_Z1(reference_pose="standing_with_arm_up", arm_joints=4)
+robot = B2_Z1(reference_pose="standing_with_arm_up", arm_joints=6)
 dynamics ="whole_body_rnea"  # see args.py for options
 
 # Tracking targets
-base_vel_des = np.array([0.1, 0, 0, 0, 0, 0])  # linear + angular velocity
-arm_vel_des = np.array([0, 0, 0])         # arm EE velocity (relative to the base)
-arm_force_des = np.array([0, 0, 0])            # arm EE force (global)
+base_vel_des = np.array([0.2, 0.05, 0, 0, 0, 0])  # linear + angular velocity (静止站立)
+arm_vel_des = np.array([0, 0, 0])             # arm EE velocity (relative to the base)
+arm_force_des = np.array([0, 0, 0])           # arm EE force (global)
+
+# 轨迹配置：yz平面半径0.2m的圆 + x方向0.1m/s的线性运动
+# 带阻抗控制（PD）来补偿位置误差
+arm_trajectory = CircleTrajectory(
+    radius=0.20,                      # 圆的半径 0.2m
+    period=3.0,                       # 画一圈的周期 3秒
+    plane="yz",                       # 在yz平面画圆
+    linear_vel=np.array([0, 0, 0]),   # 线性速度
+    kp=np.array([20.0, 20.0, 20.0]),     # 位置增益（阻抗控制）
+    kd=np.array([0.1, 0.1, 0.1]),     # 速度增益（阻抗控制）
+)
+use_impedance = True  # 是否启用阻抗控制
 
 # OCP params
 nodes = 14      # OCP nodes
@@ -25,7 +38,7 @@ dt_min = 0.015  # initial time step
 dt_max = 0.08   # final time step
 
 # Gait params
-gait_type = "stand"              # "trot", "walk" or "stand"
+gait_type = "walk"              # "trot", "walk" or "stand"
 gait_period = 0.8               # seconds
 swing_height = 0.07             # meters
 swing_vel_limits = [0.1, -0.2]  # meters/second
@@ -37,10 +50,12 @@ compile_solver = False
 load_compiled_solver = None  # None or <filename> in "codegen/lib/"
 
 # MPC
-mpc_loops = 200
+mpc_loops = 400  # 6秒 / 0.015秒 = 400步
 
 # Debug
 plot = False  # plot joint positions, velocities, torques
+
+
 
 
 def mpc_loop(ocp):
@@ -92,6 +107,37 @@ def mpc_loop(ocp):
             # --- 1. 更新优化问题参数 ---
             # 计算当前仿真时间
             t_current = k * dt_min
+            
+            # --- 计算轨迹的期望速度（带阻抗控制）---
+            if use_impedance:
+                # 获取当前末端位置和速度
+                q_current = np.array(x_init[:ocp.nq]).flatten()
+                v_current = np.array(x_init[ocp.nq:]).flatten()
+                pin.framesForwardKinematics(ocp.model, ocp.data, q_current)
+                pin.computeFrameJacobian(ocp.model, ocp.data, q_current, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED)
+                
+                # 当前末端位置（相对于基座）
+                ee_pos = ocp.data.oMf[robot.arm_ee_frame].translation.copy()
+                base_pos = ocp.data.oMf[ocp.model.getFrameId("base_link")].translation.copy()
+                base_rot = ocp.data.oMf[ocp.model.getFrameId("base_link")].rotation.copy()
+                ee_pos_rel = base_rot.T @ (ee_pos - base_pos)
+                
+                # 当前末端速度（相对于基座）
+                J = pin.getFrameJacobian(ocp.model, ocp.data, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED)
+                ee_vel = J @ v_current
+                ee_vel_lin = ee_vel[:3]
+                ee_vel_rel = base_rot.T @ ee_vel_lin
+                
+                # 带阻抗控制的速度命令
+                arm_vel_des_current = arm_trajectory.get_velocity_with_impedance(
+                    t_current, ee_pos_rel, ee_vel_rel
+                )
+            else:
+                # 纯速度跟踪
+                arm_vel_des_current = arm_trajectory.get_velocity(t_current)
+            
+            ocp.set_tracking_targets(base_vel_des, arm_vel_des_current, arm_force_des)
+            
             # 更新OCP参数：初始状态、接触序列、期望轨迹等
             # 这会根据当前时间更新步态相位、接触脚等信息
             ocp.update_params(x_init, t_current)
@@ -141,6 +187,37 @@ def mpc_loop(ocp):
         for k in range(mpc_loops):
             # --- 1. 更新优化问题参数 ---
             t_current = k * dt_min
+            
+            # --- 计算轨迹的期望速度（带阻抗控制）---
+            if use_impedance:
+                # 获取当前末端位置和速度
+                q_current = np.array(x_init[:ocp.nq]).flatten()
+                v_current = np.array(x_init[ocp.nq:]).flatten()
+                pin.framesForwardKinematics(ocp.model, ocp.data, q_current)
+                pin.computeFrameJacobian(ocp.model, ocp.data, q_current, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED)
+                
+                # 当前末端位置（相对于基座）
+                ee_pos = ocp.data.oMf[robot.arm_ee_frame].translation.copy()
+                base_pos = ocp.data.oMf[ocp.model.getFrameId("base_link")].translation.copy()
+                base_rot = ocp.data.oMf[ocp.model.getFrameId("base_link")].rotation.copy()
+                ee_pos_rel = base_rot.T @ (ee_pos - base_pos)
+                
+                # 当前末端速度（相对于基座）
+                J = pin.getFrameJacobian(ocp.model, ocp.data, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED)
+                ee_vel = J @ v_current
+                ee_vel_lin = ee_vel[:3]
+                ee_vel_rel = base_rot.T @ ee_vel_lin
+                
+                # 带阻抗控制的速度命令
+                arm_vel_des_current = arm_trajectory.get_velocity_with_impedance(
+                    t_current, ee_pos_rel, ee_vel_rel
+                )
+            else:
+                # 纯速度跟踪
+                arm_vel_des_current = arm_trajectory.get_velocity(t_current)
+            
+            ocp.set_tracking_targets(base_vel_des, arm_vel_des_current, arm_force_des)
+            
             ocp.update_params(x_init, t_current)
             
             # --- 2. 求解优化问题 ---
@@ -159,9 +236,14 @@ def mpc_loop(ocp):
     T = sum([ocp.opti.value(dt) for dt in ocp.dts])
     
     # 打印性能统计
+    total_solve_time = sum(solve_times)
+    total_sim_time = mpc_loops * dt_min
     print("************** STATS **************")
     print("Avg solve time (ms): ", np.average(solve_times) * 1000)  # 平均求解时间
     print("Std solve time (ms): ", np.std(solve_times) * 1000)      # 求解时间标准差
+    print("Total solve time (s): ", total_solve_time)               # 总求解时间
+    print("Total sim time (s): ", total_sim_time)                   # 总仿真时间
+    print("Realtime factor: ", total_sim_time / total_solve_time)   # 实时性因子 (>1 表示比实时快)
     print("Avg CV (inf norm): ", np.average(constr_viol))           # 平均约束违反
     print("Horizon length (s): ", T)                                # 预测时域长度
     
@@ -243,6 +325,74 @@ def main():
 
         plt.tight_layout(rect=[0, 0, 0.88, 1])  # adjust for legend
         plt.show()
+
+    # 提取机械臂末端轨迹（惯性系/全局坐标系）
+    arm_ee_positions = []
+    base_positions = []
+    for q in ocp.q_sol:
+        pin.framesForwardKinematics(model, data, q.flatten())
+        # 全局位置
+        ee_pos = data.oMf[robot.arm_ee_frame].translation.copy()
+        base_pos = data.oMf[model.getFrameId("base_link")].translation.copy()
+        arm_ee_positions.append(ee_pos)
+        base_positions.append(base_pos)
+    arm_ee_positions = np.array(arm_ee_positions)
+    base_positions = np.array(base_positions)
+    
+    print("末端轨迹形状:", arm_ee_positions.shape)
+    print(f"起始点（惯性系）: X={arm_ee_positions[0, 0]:.4f}, Y={arm_ee_positions[0, 1]:.4f}, Z={arm_ee_positions[0, 2]:.4f}")
+    print(f"终止点（惯性系）: X={arm_ee_positions[-1, 0]:.4f}, Y={arm_ee_positions[-1, 1]:.4f}, Z={arm_ee_positions[-1, 2]:.4f}")
+    
+    # 生成期望轨迹（惯性系）
+    # 使用初始末端位置作为轨迹起点
+    arm_trajectory.reset(arm_ee_positions[0])
+    desired_positions = []
+    for k in range(mpc_loops):
+        t = k * dt_min
+        pos_des = arm_trajectory.get_position(t, arm_ee_positions[0])
+        desired_positions.append(pos_des)
+    desired_positions = np.array(desired_positions)
+    
+    # 绘制末端轨迹（3D，惯性系）
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # 实际轨迹（蓝色）
+    ax.plot(arm_ee_positions[:, 0], arm_ee_positions[:, 1], arm_ee_positions[:, 2], 
+            'b-', linewidth=2, label='Actual Trajectory')
+    ax.scatter(arm_ee_positions[0, 0], arm_ee_positions[0, 1], arm_ee_positions[0, 2], 
+               c='g', s=100, marker='o', label='Start')
+    ax.scatter(arm_ee_positions[-1, 0], arm_ee_positions[-1, 1], arm_ee_positions[-1, 2], 
+               c='r', s=100, marker='o', label='End')
+    
+    # 期望轨迹（红色虚线）
+    ax.plot(desired_positions[:, 0], desired_positions[:, 1], desired_positions[:, 2], 
+            'r--', linewidth=2, alpha=0.7, label='Desired Trajectory')
+    
+    # 基座轨迹（灰色）
+    ax.plot(base_positions[:, 0], base_positions[:, 1], base_positions[:, 2], 
+            'gray', linewidth=1, alpha=0.5, label='Base Trajectory')
+    
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title('Arm End-Effector Trajectory (Inertial Frame)')
+    
+    # 强制XYZ刻度一致
+    all_positions = np.vstack([arm_ee_positions, desired_positions, base_positions])
+    max_range = np.max([
+        all_positions[:, 0].max() - all_positions[:, 0].min(),
+        all_positions[:, 1].max() - all_positions[:, 1].min(),
+        all_positions[:, 2].max() - all_positions[:, 2].min()
+    ]) / 2
+    mid_x = (all_positions[:, 0].max() + all_positions[:, 0].min()) / 2
+    mid_y = (all_positions[:, 1].max() + all_positions[:, 1].min()) / 2
+    mid_z = (all_positions[:, 2].max() + all_positions[:, 2].min()) / 2
+    ax.set_xlim(mid_x - max_range, mid_x + max_range)
+    ax.set_ylim(mid_y - max_range, mid_y + max_range)
+    ax.set_zlim(mid_z - max_range, mid_z + max_range)
+    ax.legend()
+    plt.show()
 
     # Visualize robot
     robot_instance.initViewer()
