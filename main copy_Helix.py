@@ -7,38 +7,37 @@ import matplotlib.pyplot as plt
 from args import *
 from utils.robot import *
 from utils.visualization import visualize_forces
-from utils.trajectory import CircleTrajectory, HelixTrajectory
+from utils.trajectory import HelixTrajectory
 from optimization import make_ocp
 
 # Robot params
-robot = B2_Z1(reference_pose="standing_with_arm_up", arm_joints=6)
+robot = B2_Z1(reference_pose="standing_with_arm_up", arm_joints=4)
 dynamics ="whole_body_rnea"  # see args.py for options
 
 # Tracking targets
-base_vel_des = np.array([0.2, 0.05, 0, 0, 0, 0])  # linear + angular velocity (静止站立)
+base_vel_des = np.array([0.0, 0.0, 0, 0, 0, 0])  # linear + angular velocity (静止站立)
 arm_vel_des = np.array([0, 0, 0])             # arm EE velocity (relative to the base)
 arm_force_des = np.array([0, 0, 0])           # arm EE force (global)
 
-# 轨迹配置：yz平面半径0.2m的圆 + x方向0.1m/s的线性运动
-# 带阻抗控制（PD）来补偿位置误差
-arm_trajectory = CircleTrajectory(
+# 轨迹配置：世界系螺旋（yz平面画圆 + x方向匀速）
+# 固定使用世界系阻抗控制（PD）来补偿位置误差
+arm_trajectory = HelixTrajectory(
     radius=0.20,                      # 圆的半径 0.2m
     period=3.0,                       # 画一圈的周期 3秒
     plane="yz",                       # 在yz平面画圆
-    linear_vel=np.array([0, 0, 0]),   # 线性速度
-    kp=np.array([20.0, 20.0, 20.0]),     # 位置增益（阻抗控制）
+    axial_vel=0.0,                   # 螺旋轴向速度（x方向）
+    kp=np.array([20.0, 20.0, 20.0]),  # 位置增益（阻抗控制）
     kd=np.array([0.1, 0.1, 0.1]),     # 速度增益（阻抗控制）
 )
-use_impedance = True  # 是否启用阻抗控制
 
 # OCP params
 nodes = 14      # OCP nodes
-tau_nodes = 3   # add torque limits for this many nodes
+tau_nodes = 2   # add torque limits for this many nodes
 dt_min = 0.015  # initial time step
 dt_max = 0.08   # final time step
 
 # Gait params
-gait_type = "walk"              # "trot", "walk" or "stand"
+gait_type = "stand"              # "trot", "walk" or "stand"
 gait_period = 0.8               # seconds
 swing_height = 0.07             # meters
 swing_vel_limits = [0.1, -0.2]  # meters/second
@@ -88,6 +87,8 @@ def mpc_loop(ocp):
     if compile_solver:
         ocp.compile_solver()
     
+    base_frame_id = ocp.model.getFrameId("base_link")
+
     # ========== 根据求解器类型选择不同的求解路径 ==========
     if solver == "fatrop" or solver == "ipopt":
         # ===== Fatrop/IPOPT求解器路径 =====
@@ -108,50 +109,52 @@ def mpc_loop(ocp):
             # 计算当前仿真时间
             t_current = k * dt_min
             
-            # --- 计算轨迹的期望速度（带阻抗控制）---
-            if use_impedance:
-                # 获取当前末端位置和速度
-                q_current = np.array(x_init[:ocp.nq]).flatten()
-                v_current = np.array(x_init[ocp.nq:]).flatten()
-                pin.framesForwardKinematics(ocp.model, ocp.data, q_current)
-                pin.computeFrameJacobian(ocp.model, ocp.data, q_current, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED)
-                
-                # 当前末端位置（相对于基座）
-                ee_pos = ocp.data.oMf[robot.arm_ee_frame].translation.copy()
-                base_pos = ocp.data.oMf[ocp.model.getFrameId("base_link")].translation.copy()
-                base_rot = ocp.data.oMf[ocp.model.getFrameId("base_link")].rotation.copy()
-                ee_pos_rel = base_rot.T @ (ee_pos - base_pos)
-                
-                # 当前末端速度（相对于基座）
-                J = pin.getFrameJacobian(ocp.model, ocp.data, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED)
-                ee_vel = J @ v_current
-                ee_vel_lin = ee_vel[:3]
-                ee_vel_rel = base_rot.T @ ee_vel_lin
-                
-                # 带阻抗控制的速度命令
-                arm_vel_des_current = arm_trajectory.get_velocity_with_impedance(
-                    t_current, ee_pos_rel, ee_vel_rel
-                )
-            else:
-                # 纯速度跟踪
-                arm_vel_des_current = arm_trajectory.get_velocity(t_current)
+            # --- 计算轨迹的期望速度（固定：世界系阻抗跟踪）---
+            # 获取当前末端位置和速度（世界系）
+            q_current = np.array(x_init[:ocp.nq]).flatten()
+            v_current = np.array(x_init[ocp.nq:]).flatten()
+            pin.framesForwardKinematics(ocp.model, ocp.data, q_current)
+            pin.computeFrameJacobian(
+                ocp.model, ocp.data, q_current, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED
+            )
+
+            ee_pos_world = ocp.data.oMf[robot.arm_ee_frame].translation.copy()
+            base_pos_world = ocp.data.oMf[base_frame_id].translation.copy()
+            base_rot_world = ocp.data.oMf[base_frame_id].rotation.copy()
+            
+            # robot.arm_ee_frame初始化时先设为 None，B2_Z1.__init__ 里，如果 arm_joints > 0，才赋值：
+            J = pin.getFrameJacobian(
+                ocp.model, ocp.data, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED
+            )
+            ee_vel_world = (J @ v_current)[:3]
+
+            # 在世界系生成末端“阻抗修正后的期望速度”
+            v_cmd_world = arm_trajectory.get_velocity_with_impedance(
+                t_current, ee_pos_world, ee_vel_world
+            )
+            # 把它从“绝对世界速度”改成“相对基座的速度”（扣掉基座平动+转动引起的末端速度）
+            arm_pos_rel = ee_pos_world - base_pos_world
+            v_cmd_world_corr = (
+                v_cmd_world - base_vel_des[:3] - np.cross(base_vel_des[3:], arm_pos_rel)
+            )
+            # 再把速度从世界系表达转换到基座坐标系表达
+            arm_vel_des_current = base_rot_world.T @ v_cmd_world_corr
             
             ocp.set_tracking_targets(base_vel_des, arm_vel_des_current, arm_force_des)
             
-            # 更新OCP参数：初始状态、接触序列、期望轨迹等
-            # 这会根据当前时间更新步态相位、接触脚等信息
+            # update_params会做两件事（在 ocp.py 里）：把当前状态写进 CasADi 参数 self.x_init，更新步态序列/接触调度
             ocp.update_params(x_init, t_current)
             # 获取所有求解器参数（打包成列表）
             solver_params = ocp.get_solver_params()
             
             # --- 2. 求解优化问题 ---
             # 记录求解开始时间
-            start_time = time.time()
+            start_time = time.perf_counter()
             # 调用求解器函数，输入当前参数，输出最优解
             # sol_x包含所有节点的状态和控制输入
             sol_x = solver_function(*solver_params)
             # 记录求解结束时间
-            end_time = time.time()
+            end_time = time.perf_counter()
             # 计算求解耗时
             sol_time = end_time - start_time
             solve_times.append(sol_time)
@@ -188,33 +191,36 @@ def mpc_loop(ocp):
             # --- 1. 更新优化问题参数 ---
             t_current = k * dt_min
             
-            # --- 计算轨迹的期望速度（带阻抗控制）---
-            if use_impedance:
-                # 获取当前末端位置和速度
-                q_current = np.array(x_init[:ocp.nq]).flatten()
-                v_current = np.array(x_init[ocp.nq:]).flatten()
-                pin.framesForwardKinematics(ocp.model, ocp.data, q_current)
-                pin.computeFrameJacobian(ocp.model, ocp.data, q_current, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED)
-                
-                # 当前末端位置（相对于基座）
-                ee_pos = ocp.data.oMf[robot.arm_ee_frame].translation.copy()
-                base_pos = ocp.data.oMf[ocp.model.getFrameId("base_link")].translation.copy()
-                base_rot = ocp.data.oMf[ocp.model.getFrameId("base_link")].rotation.copy()
-                ee_pos_rel = base_rot.T @ (ee_pos - base_pos)
-                
-                # 当前末端速度（相对于基座）
-                J = pin.getFrameJacobian(ocp.model, ocp.data, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED)
-                ee_vel = J @ v_current
-                ee_vel_lin = ee_vel[:3]
-                ee_vel_rel = base_rot.T @ ee_vel_lin
-                
-                # 带阻抗控制的速度命令
-                arm_vel_des_current = arm_trajectory.get_velocity_with_impedance(
-                    t_current, ee_pos_rel, ee_vel_rel
-                )
-            else:
-                # 纯速度跟踪
-                arm_vel_des_current = arm_trajectory.get_velocity(t_current)
+            # --- 计算轨迹的期望速度（固定：世界系阻抗跟踪）---
+            # 获取当前末端位置和速度（世界系）
+            q_current = np.array(x_init[:ocp.nq]).flatten()
+            v_current = np.array(x_init[ocp.nq:]).flatten()
+            pin.framesForwardKinematics(ocp.model, ocp.data, q_current)
+            pin.computeFrameJacobian(
+                ocp.model, ocp.data, q_current, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED
+            )
+
+            ee_pos_world = ocp.data.oMf[robot.arm_ee_frame].translation.copy()
+            base_pos_world = ocp.data.oMf[base_frame_id].translation.copy()
+            base_rot_world = ocp.data.oMf[base_frame_id].rotation.copy()
+
+            J = pin.getFrameJacobian(
+                ocp.model, ocp.data, robot.arm_ee_frame, pin.LOCAL_WORLD_ALIGNED
+            )
+            ee_vel_world = (J @ v_current)[:3]
+
+            # 世界系下计算阻抗速度命令
+            v_cmd_world = arm_trajectory.get_velocity_with_impedance(
+                t_current, ee_pos_world, ee_vel_world
+            )
+            # 转换为相对基座的速度命令（与OCP内部的速度合成方式一致）
+            arm_pos_rel = ee_pos_world - base_pos_world
+            v_cmd_world_corr = (
+                v_cmd_world
+                - base_vel_des[:3]
+                - np.cross(base_vel_des[3:], arm_pos_rel)
+            )
+            arm_vel_des_current = base_rot_world.T @ v_cmd_world_corr
             
             ocp.set_tracking_targets(base_vel_des, arm_vel_des_current, arm_force_des)
             

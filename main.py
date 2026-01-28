@@ -21,7 +21,7 @@ arm_force_des = np.array([0, 0, 0])           # arm EE force (global)
 # Circle trajectory params (机械臂末端画圆参数)
 circle_radius = 0.10       # 圆的半径 10cm
 circle_period = 3.0        # 画一圈的周期（秒）
-circle_plane = "yz"        # 画圆的平面: "xy", "xz", or "yz"
+circle_plane = "xy"        # 画圆的平面: "xy", "xz", or "yz"
 
 # OCP params
 nodes = 14      # OCP nodes
@@ -30,16 +30,16 @@ dt_min = 0.015  # initial time step
 dt_max = 0.08   # final time step
 
 # Gait params
-gait_type = "walk"              # "trot", "walk" or "stand"
+gait_type = "stand"              # "trot", "walk" or "stand"
 gait_period = 0.8               # seconds
 swing_height = 0.07             # meters
 swing_vel_limits = [0.1, -0.2]  # meters/second
 
 # Solver
-solver = "fatrop"  # see args.py for options
+solver = "osqp"  # see args.py for options
 warm_start = True
 compile_solver = False
-load_compiled_solver = None  # None or <filename> in "codegen/lib/"
+load_compiled_solver = "solver_function.so"  # None or <filename> in "codegen/lib/"
 
 # MPC
 mpc_loops = 200
@@ -302,51 +302,26 @@ def main():
         plt.tight_layout(rect=[0, 0, 0.88, 1])  # adjust for legend
         plt.show()
 
-    # 提取机械臂末端轨迹（相对于基座）
+    # 提取机械臂末端轨迹
     arm_ee_positions = []
-    base_positions = []
-    arm_ee_relative = []  # 相对于基座的位置
     for q in ocp.q_sol:
         pin.framesForwardKinematics(model, data, q.flatten())
-        # 全局位置
-        ee_pos = data.oMf[robot.arm_ee_frame].translation.copy()
-        base_pos = data.oMf[model.getFrameId("base_link")].translation.copy()
-        base_rot = data.oMf[model.getFrameId("base_link")].rotation.copy()
-        # 相对于基座的位置（在基座坐标系下）
-        ee_rel = base_rot.T @ (ee_pos - base_pos)
-        arm_ee_positions.append(ee_pos)
-        base_positions.append(base_pos)
-        arm_ee_relative.append(ee_rel)
+        pos = data.oMf[robot.arm_ee_frame].translation.copy()
+        arm_ee_positions.append(pos)
     arm_ee_positions = np.array(arm_ee_positions)
-    base_positions = np.array(base_positions)
-    arm_ee_relative = np.array(arm_ee_relative)
-    print("末端轨迹形状:", arm_ee_relative.shape)
-    print(f"起始点（相对基座）: X={arm_ee_relative[0, 0]:.4f}, Y={arm_ee_relative[0, 1]:.4f}, Z={arm_ee_relative[0, 2]:.4f}")
-    print(f"终止点（相对基座）: X={arm_ee_relative[-1, 0]:.4f}, Y={arm_ee_relative[-1, 1]:.4f}, Z={arm_ee_relative[-1, 2]:.4f}")
-    print("因为MPC 跟踪的是速度，不是位置, 速度误差会累积成位置误差，所以轨迹不是完美的圆形的")
-    # 绘制末端轨迹（3D，相对于基座）
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.plot(arm_ee_relative[:, 0], arm_ee_relative[:, 1], arm_ee_relative[:, 2], 'b-', linewidth=2)
-    ax.scatter(arm_ee_relative[0, 0], arm_ee_relative[0, 1], arm_ee_relative[0, 2], c='g', s=100, label='Start')
-    ax.scatter(arm_ee_relative[-1, 0], arm_ee_relative[-1, 1], arm_ee_relative[-1, 2], c='r', s=100, label='End')
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    ax.set_zlabel('Z (m)')
-    ax.set_title('Arm End-Effector Trajectory (Relative to Base)')
-    # 强制XYZ刻度一致
-    max_range = np.max([
-        arm_ee_relative[:, 0].max() - arm_ee_relative[:, 0].min(),
-        arm_ee_relative[:, 1].max() - arm_ee_relative[:, 1].min(),
-        arm_ee_relative[:, 2].max() - arm_ee_relative[:, 2].min()
-    ]) / 2
-    mid_x = (arm_ee_relative[:, 0].max() + arm_ee_relative[:, 0].min()) / 2
-    mid_y = (arm_ee_relative[:, 1].max() + arm_ee_relative[:, 1].min()) / 2
-    mid_z = (arm_ee_relative[:, 2].max() + arm_ee_relative[:, 2].min()) / 2
-    ax.set_xlim(mid_x - max_range, mid_x + max_range)
-    ax.set_ylim(mid_y - max_range, mid_y + max_range)
-    ax.set_zlim(mid_z - max_range, mid_z + max_range)
-    ax.legend()
+    print("末端轨迹形状:", arm_ee_positions.shape)
+
+    # 绘制末端轨迹（俯视图）
+    plt.figure(figsize=(8, 8))
+    plt.plot(arm_ee_positions[:, 0], arm_ee_positions[:, 1], 'b-', linewidth=2)
+    plt.plot(arm_ee_positions[0, 0], arm_ee_positions[0, 1], 'go', markersize=10, label='Start')
+    plt.plot(arm_ee_positions[-1, 0], arm_ee_positions[-1, 1], 'ro', markersize=10, label='End')
+    plt.xlabel('X (m)')
+    plt.ylabel('Y (m)')
+    plt.title('Arm End-Effector Trajectory (Top View)')
+    plt.axis('equal')
+    plt.grid(True)
+    plt.legend()
     plt.show()
 
     # Visualize robot

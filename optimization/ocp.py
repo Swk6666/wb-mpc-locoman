@@ -152,25 +152,6 @@ class OCP:
         # 第一个节点的状态增量必须为0（从给定初始状态开始）
         self.opti.subject_to(self.DX_opt[0] == [0] * self.ndx_opt)
 
-        # ========== 机械臂末端执行器全局速度目标计算 ==========
-        if self.arm_ee_frame:
-            # 从初始状态提取信息
-            q_0 = self.x_init[:self.nq]  # 初始位置
-            arm_pos_0 = self.dyn.get_frame_position(self.arm_ee_frame)(q_0)  # 机械臂末端位置
-            base_pos_0 = self.dyn.get_base_position()(q_0)  # 基座位置
-            base_rot_0 = self.dyn.get_base_rotation()(q_0)  # 基座旋转矩阵
-
-            # 将相对于基座的期望速度转换为全局坐标系
-            arm_vel_des_global = base_rot_0 @ self.arm_vel_des
-            arm_vel_des_global[2] = self.arm_vel_des[2]  # 保持z方向速度
-            arm_vel_des_global += self.base_vel_des[:3]  # 添加基座线速度
-
-            # 考虑基座角速度对末端执行器的影响
-            base_ang_vel = self.base_vel_des[3:]  # 基座角速度
-            arm_pos_rel = arm_pos_0 - base_pos_0  # 末端相对于基座的位置
-            ang_vel_correction = ca.cross(base_ang_vel, arm_pos_rel)  # 角速度引起的线速度
-            arm_vel_des_global += ang_vel_correction
-
         # ========== 对每个节点设置约束 ==========
         for i in range(self.nodes):
             # 获取当前节点的状态和输入信息
@@ -178,8 +159,25 @@ class OCP:
             v = self.get_v(i)        # 速度
             forces = self.get_forces(i)  # 接触力
 
-            # 动力学约束（在子类中实现）
+            # 动力学约束（在子类中实现）optimization/ocp_whole_body_rnea.py 里实现
             self.setup_dynamics_constraints(i)
+
+            # ========== 机械臂末端执行器全局速度目标计算（每个节点） ==========
+            # 这里都是 CasADi 的符号表达式
+            if self.arm_ee_frame:
+                base_pos = self.dyn.get_base_position()(q)  # 基座位置
+                base_rot = self.dyn.get_base_rotation()(q)  # 基座旋转矩阵
+                arm_pos = self.dyn.get_frame_position(self.arm_ee_frame)(q)  # 机械臂末端位置
+
+                # 将相对于基座的期望速度转换为全局坐标系
+                arm_vel_des_global = base_rot @ self.arm_vel_des
+                arm_vel_des_global += self.base_vel_des[:3]  # 添加基座线速度
+
+                # 考虑基座角速度对末端执行器的影响
+                base_ang_vel = self.base_vel_des[3:]  # 基座角速度
+                arm_pos_rel = arm_pos - base_pos  # 末端相对于基座的位置
+                ang_vel_correction = ca.cross(base_ang_vel, arm_pos_rel)  # 角速度引起的线速度
+                arm_vel_des_global += ang_vel_correction
 
             # ========== 接触和摆动约束 ==========
             for idx, frame_id in enumerate(self.foot_frames):
@@ -456,34 +454,34 @@ class OCP:
             # Get current state and parameters
             current_x = self.opti.value(self.opti.x, self.opti.initial())
             current_params = self.opti.value(self.opti.p, self.opti.initial())
-            start_time = time.time()
+            start_time = time.perf_counter()
 
             for _ in range(self.sqp_iters):
                 # Get data
-                start = time.time()
+                start = time.perf_counter()
                 grad_f, J_g, g, lbg, ubg = self.sqp_data(current_x, current_params)
-                end = time.time()
+                end = time.perf_counter()
                 print("Data time (ms): ", (end - start) * 1000)
 
-                start = time.time()
+                start = time.perf_counter()
                 A = np.array(J_g.nonzeros())
                 q = np.array(grad_f)
                 l = np.array(lbg - g)
                 u = np.array(ubg - g)
                 self.osqp_prob.update(q=q, Ax=A, l=l, u=u)
-                end = time.time()
+                end = time.perf_counter()
                 print("Update time (ms): ", (end - start) * 1000)
 
                 # Solve
-                start = time.time()
+                start = time.perf_counter()
                 sol_dx = self.osqp_prob.solve().x
-                end = time.time()
+                end = time.perf_counter()
                 print("Solve time (ms): ", (end - start) * 1000)
 
                 # Line search
                 current_x = self._armijo_line_search(sol_dx, current_x, current_params)
 
-            end_time = time.time()
+            end_time = time.perf_counter()
             self.solve_time = end_time - start_time
 
             g, lbg, ubg = self.g_data(current_x, current_params)
